@@ -1,5 +1,10 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { createMuxedAddress, sponsorNewAccount, accountHasUsdcTrustline, getAccountUsdcBalance } from "./accounts";
+import {
+  createMuxedAddress,
+  sponsorNewAccount,
+  accountHasUsdcTrustline,
+  combineSignatures,
+} from "./accounts";
 import * as client from "./client";
 import {
   MuxedAccount,
@@ -8,6 +13,10 @@ import {
   Operation,
   BASE_FEE,
   Asset,
+  Account,
+  Networks,
+  StrKey,
+  xdr,
 } from "@stellar/stellar-sdk";
 
 // Mocks
@@ -113,9 +122,9 @@ describe("sponsorNewAccount", () => {
       .mockRejectedValue(Object.assign(new Error("Bad request"), { status: 400 }));
     (client.getHorizonServer as any).mockReturnValue({ loadAccount });
 
-    await expect(
-      sponsorNewAccount(winnerPublicKey, sponsorSecret, "testnet")
-    ).rejects.toThrow("Bad request");
+    await expect(sponsorNewAccount(winnerPublicKey, sponsorSecret, "testnet")).rejects.toThrow(
+      "Bad request"
+    );
     expect(loadAccount).toHaveBeenCalledTimes(1);
   });
 });
@@ -286,5 +295,127 @@ describe("createMuxedAddress determinism", () => {
     // Verify deterministic - same inputs = same output
     const slug2 = createMuxedAddress(testPublicKey, testUserId);
     expect(slug).toBe(slug2);
+  });
+});
+
+// --- combineSignatures ---
+
+describe("combineSignatures", () => {
+  const passphrase = Networks.TESTNET;
+
+  // Builds and signs a classic (v1) transaction with the given signers.
+  // All envelopes built from the same source/seq share the same tx hash, so
+  // signatures from different keypairs can be merged.
+  function signedEnvelope(source: Keypair, signers: Keypair[]): string {
+    const tx = new TransactionBuilder(new Account(source.publicKey(), "1"), {
+      fee: BASE_FEE,
+      networkPassphrase: passphrase,
+    })
+      .addOperation(Operation.bumpSequence({ bumpTo: "1" }))
+      .setTimeout(300)
+      .build();
+    for (const signer of signers) tx.sign(signer);
+    return tx.toEnvelope().toXDR("base64");
+  }
+
+  function signaturesOf(xdrEnvelope: string): xdr.DecoratedSignature[] {
+    const env = xdr.TransactionEnvelope.fromXDR(xdrEnvelope, "base64");
+    if (env.switch().name === "envelopeTypeTxV0") return env.v0().signatures();
+    return env.v1().signatures();
+  }
+
+  it("throws when given an empty array", async () => {
+    await expect(combineSignatures([])).rejects.toThrow("At least one signed envelope required");
+  });
+
+  it("combines single-signature envelopes from two keypairs into one envelope with both signatures", async () => {
+    const source = Keypair.random();
+    const signerA = Keypair.random();
+    const signerB = Keypair.random();
+
+    // Same transaction, each envelope carries only one signer's signature.
+    const envA = signedEnvelope(source, [signerA]);
+    const envB = signedEnvelope(source, [signerB]);
+    expect(signaturesOf(envA)).toHaveLength(1);
+    expect(signaturesOf(envB)).toHaveLength(1);
+
+    const combined = await combineSignatures([envA, envB]);
+    const hints = signaturesOf(combined).map((sig) => sig.hint().toString("hex"));
+
+    expect(hints).toHaveLength(2);
+    // A signature hint is the last 4 bytes of the signer's public key.
+    expect(hints).toEqual(
+      expect.arrayContaining([
+        Buffer.from(StrKey.decodeEd25519PublicKey(signerA.publicKey()))
+          .subarray(-4)
+          .toString("hex"),
+        Buffer.from(StrKey.decodeEd25519PublicKey(signerB.publicKey()))
+          .subarray(-4)
+          .toString("hex"),
+      ])
+    );
+  });
+
+  it("deduplicates identical signatures across input envelopes", async () => {
+    const source = Keypair.random();
+    const signerA = Keypair.random();
+    const signerB = Keypair.random();
+
+    const envA = signedEnvelope(source, [signerA]);
+    const envB = signedEnvelope(source, [signerB]);
+
+    // envA appears twice, and its signature must only appear once in the output.
+    const combined = await combineSignatures([envA, envA, envB]);
+
+    expect(signaturesOf(combined)).toHaveLength(2);
+  });
+
+  it("combines v0 envelopes and keeps the v0 envelope type", async () => {
+    const source = Keypair.random();
+    const signerA = Keypair.random();
+    const signerB = Keypair.random();
+
+    // Build the v0 body from the same fields as the v1 transaction above.
+    const v0Body = new xdr.TransactionV0({
+      sourceAccountEd25519: StrKey.decodeEd25519PublicKey(source.publicKey()),
+      fee: 100,
+      seqNum: xdr.Int64.fromString("2"),
+      timeBounds: null,
+      memo: xdr.Memo.memoNone(),
+      operations: [
+        new xdr.Operation({
+          sourceAccount: null,
+          body: xdr.OperationBody.bumpSequence(
+            new xdr.BumpSequenceOp({ bumpTo: xdr.Int64.fromString("1") })
+          ),
+        }),
+      ],
+      ext: new xdr.TransactionV0Ext(0),
+    });
+
+    // v0 signatures cover the same payload as the equivalent v1 transaction.
+    const payloadTx = new TransactionBuilder(new Account(source.publicKey(), "1"), {
+      fee: BASE_FEE,
+      networkPassphrase: passphrase,
+    })
+      .addOperation(Operation.bumpSequence({ bumpTo: "1" }))
+      .setTimeout(0)
+      .build();
+    const hash = payloadTx.hash();
+
+    const v0Envelope = (signer: Keypair): string =>
+      xdr.TransactionEnvelope.envelopeTypeTxV0(
+        new xdr.TransactionV0Envelope({
+          tx: v0Body,
+          signatures: [signer.signDecorated(hash)],
+        })
+      ).toXDR("base64");
+
+    const combined = await combineSignatures([v0Envelope(signerA), v0Envelope(signerB)]);
+    const env = xdr.TransactionEnvelope.fromXDR(combined, "base64");
+
+    expect(env.switch().name).toBe("envelopeTypeTxV0");
+    expect(env.v0().signatures()).toHaveLength(2);
+    expect(env.v0().tx().seqNum().toString()).toBe("2");
   });
 });

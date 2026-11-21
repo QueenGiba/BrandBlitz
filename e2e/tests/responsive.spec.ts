@@ -1,4 +1,5 @@
-import { expect, test } from "@playwright/test";
+import { expect, request as playwrightRequest, test, type Page } from "@playwright/test";
+import { seedActiveChallenge, signInWithMockGoogle } from "./helpers";
 
 const VIEWPORTS = [
   { width: 375, height: 812, label: "mobile-375" },
@@ -9,19 +10,99 @@ const VIEWPORTS = [
 
 const PUBLIC_ROUTES = ["/", "/login", "/leaderboard"];
 
+async function expectNoHorizontalOverflow(page: Page) {
+  const { scrollWidth, innerWidth } = await page.evaluate(() => ({
+    scrollWidth: document.documentElement.scrollWidth,
+    innerWidth: window.innerWidth,
+  }));
+  expect(
+    scrollWidth,
+    `scrollWidth ${scrollWidth}px exceeds the ${innerWidth}px viewport`
+  ).toBeLessThanOrEqual(innerWidth);
+}
+
 for (const viewport of VIEWPORTS) {
   for (const route of PUBLIC_ROUTES) {
     test(`no horizontal scroll at ${viewport.width}px on ${route}`, async ({ page }) => {
       await page.setViewportSize({ width: viewport.width, height: viewport.height });
       await page.goto(route);
-
-      const hasOverflow = await page.evaluate(
-        () => document.documentElement.scrollWidth > window.innerWidth
-      );
-      expect(hasOverflow).toBe(false);
+      await expectNoHorizontalOverflow(page);
     });
   }
 }
+
+// ── Authenticated pages (#829) ───────────────────────────────────────────────
+// The dashboard, brand and challenge pages render tables, charts and forms
+// that are far more likely to overflow on narrow screens than the public
+// pages above. One brand with a funded challenge is seeded for the whole
+// matrix; brand pages are viewed as its owner, the challenge as a player.
+
+const BRAND_OWNER = { email: "responsive-owner@example.com", name: "Responsive Owner" };
+const PLAYER = { email: "responsive-player@example.com", name: "Responsive Player" };
+
+type Seeded = { brandId: string; challengeId: string };
+
+interface AuthenticatedRoute {
+  label: string;
+  path: (seeded: Seeded) => string;
+  as: typeof BRAND_OWNER;
+  /** Something that is only on screen once the page has loaded its data. */
+  ready: (page: Page) => Promise<void>;
+}
+
+const AUTHENTICATED_ROUTES: AuthenticatedRoute[] = [
+  {
+    label: "/dashboard",
+    path: () => "/dashboard",
+    as: BRAND_OWNER,
+    ready: (page) => page.waitForLoadState("networkidle"),
+  },
+  {
+    label: "/brand/new",
+    path: () => "/brand/new",
+    as: BRAND_OWNER,
+    ready: (page) => expect(page.getByRole("heading", { name: "Create Brand Kit" })).toBeVisible(),
+  },
+  {
+    label: "/brand/[id]/analytics",
+    path: ({ brandId }) => `/brand/${brandId}/analytics`,
+    as: BRAND_OWNER,
+    ready: (page) => page.waitForLoadState("networkidle"),
+  },
+  {
+    label: "/challenge/[id]",
+    path: ({ challengeId }) => `/challenge/${challengeId}`,
+    as: PLAYER,
+    ready: (page) => expect(page.getByText(/Study this brand carefully/i)).toBeVisible(),
+  },
+];
+
+test.describe("no horizontal scroll on authenticated pages", () => {
+  let seeded: Seeded;
+
+  test.beforeAll(async () => {
+    const api = await playwrightRequest.newContext();
+    try {
+      const { brandId, challengeId } = await seedActiveChallenge(api, BRAND_OWNER);
+      seeded = { brandId, challengeId };
+    } finally {
+      await api.dispose();
+    }
+  });
+
+  for (const viewport of VIEWPORTS) {
+    for (const route of AUTHENTICATED_ROUTES) {
+      test(`no horizontal scroll at ${viewport.width}px on ${route.label}`, async ({ page }) => {
+        await page.setViewportSize({ width: viewport.width, height: viewport.height });
+        const path = route.path(seeded);
+        await signInWithMockGoogle(page, route.as, path);
+        await page.waitForURL(`**${path}`);
+        await route.ready(page);
+        await expectNoHorizontalOverflow(page);
+      });
+    }
+  }
+});
 
 test("hamburger button visible at 375px on home page", async ({ page }) => {
   await page.setViewportSize({ width: 375, height: 812 });

@@ -73,6 +73,13 @@ function formatTime(iso: string): string {
 
 const POLL_INTERVAL_MS = 30_000;
 
+/**
+ * Consecutive failed polls after which the bell shows that it can no longer
+ * load notifications, so an outage is not mistaken for "nothing new" (#844).
+ * One successful poll clears it.
+ */
+export const POLL_FAILURE_THRESHOLD = 3;
+
 type PushUiState = "checking" | "unsupported" | "unconfigured" | "denied" | "enabled" | "disabled";
 
 function pushDescriptionFor(state: PushUiState): string {
@@ -105,6 +112,14 @@ export function NotificationBell({ apiToken }: NotificationBellProps) {
   const drawerRef = useRef<HTMLDivElement>(null);
   const [pushState, setPushState] = useState<PushUiState>("checking");
   const [pushBusy, setPushBusy] = useState(false);
+  const consecutivePollFailures = useRef(0);
+  // Mirrors `notifications` so the mark-read handlers know synchronously which
+  // items they are about to mark, and can roll back exactly those.
+  const notificationsRef = useRef<Notification[]>([]);
+  useEffect(() => {
+    notificationsRef.current = notifications;
+  }, [notifications]);
+  const [pollDegraded, setPollDegraded] = useState(false);
 
   const [statusFeedback, setStatusFeedback] = useState<{
     message: string;
@@ -128,8 +143,17 @@ export function NotificationBell({ apiToken }: NotificationBellProps) {
         ]);
         newOnes.forEach((n) => seenIds.current.add(n.id));
       }
-    } catch {
-      // silently swallow — bell is non-critical
+      consecutivePollFailures.current = 0;
+      setPollDegraded(false);
+    } catch (err) {
+      // The bell is non-critical, so a failure never blocks the page, but it is
+      // logged and, once it persists, shown instead of looking like zero unread.
+      consecutivePollFailures.current += 1;
+      console.warn(
+        `[notification-bell] failed to fetch notifications (${consecutivePollFailures.current} in a row)`,
+        err
+      );
+      if (consecutivePollFailures.current >= POLL_FAILURE_THRESHOLD) setPollDegraded(true);
     }
   }, [apiToken]);
 
@@ -266,34 +290,55 @@ export function NotificationBell({ apiToken }: NotificationBellProps) {
     };
   }, [drawerOpen]);
 
+  /**
+   * Put back `read_at: null` on notifications whose mark-read request failed,
+   * so the UI never shows as read what the server still has as unread (#845).
+   * Only the ids this call marked are touched.
+   */
+  const rollBackRead = useCallback((ids: ReadonlySet<string>) => {
+    setNotifications((prev) => prev.map((n) => (ids.has(n.id) ? { ...n, read_at: null } : n)));
+  }, []);
+
   const markRead = useCallback(
     async (id: string) => {
+      const now = new Date().toISOString();
+      const marked = notificationsRef.current.some((n) => n.id === id && !n.read_at);
+      if (marked) {
+        setNotifications((prev) =>
+          prev.map((n) => (n.id === id && !n.read_at ? { ...n, read_at: now } : n))
+        );
+      }
       try {
         const api = createApiClient(apiToken);
         await api.patch(`/users/me/notifications/${id}/read`, {}, { skipErrorToast: true });
-        setNotifications((prev) =>
-          prev.map((n) => (n.id === id ? { ...n, read_at: new Date().toISOString() } : n))
-        );
-      } catch {
-        // best-effort
+      } catch (err) {
+        console.warn(`[notification-bell] failed to mark notification ${id} as read`, err);
+        if (marked) rollBackRead(new Set([id]));
+        setStatusFeedback({ message: "Couldn't mark notification as read", type: "error" });
+        setTimeout(() => setStatusFeedback(null), 3000);
       }
     },
-    [apiToken]
+    [apiToken, rollBackRead]
   );
 
   const markAllRead = useCallback(async () => {
+    const now = new Date().toISOString();
+    const marked = new Set(notificationsRef.current.filter((n) => !n.read_at).map((n) => n.id));
+    setNotifications((prev) =>
+      prev.map((n) => (marked.has(n.id) && !n.read_at ? { ...n, read_at: now } : n))
+    );
     try {
       const api = createApiClient(apiToken);
       await api.patch("/users/me/notifications/read-all", {}, { skipErrorToast: true });
-      const now = new Date().toISOString();
-      setNotifications((prev) => prev.map((n) => ({ ...n, read_at: n.read_at ?? now })));
       setStatusFeedback({ message: "All notifications marked as read", type: "success" });
-    } catch {
+    } catch (err) {
+      console.warn("[notification-bell] failed to mark all notifications as read", err);
+      rollBackRead(marked);
       setStatusFeedback({ message: "Failed to mark notifications as read", type: "error" });
     } finally {
       setTimeout(() => setStatusFeedback(null), 3000);
     }
-  }, [apiToken]);
+  }, [apiToken, rollBackRead]);
 
   const dismissToast = useCallback(
     (id: string) => {
@@ -319,7 +364,10 @@ export function NotificationBell({ apiToken }: NotificationBellProps) {
       {/* Bell button */}
       <div className="relative" ref={drawerRef}>
         <button
-          aria-label={`Notifications${unreadCount > 0 ? ` (${unreadCount} unread)` : ""}`}
+          aria-label={`Notifications${unreadCount > 0 ? ` (${unreadCount} unread)` : ""}${
+            pollDegraded ? " (updates unavailable)" : ""
+          }`}
+          data-state={pollDegraded ? "degraded" : "ok"}
           onClick={() => setDrawerOpen((prev) => !prev)}
           className="relative flex h-9 w-9 items-center justify-center rounded-md transition-colors hover:bg-[var(--muted)]"
         >
@@ -338,6 +386,13 @@ export function NotificationBell({ apiToken }: NotificationBellProps) {
             <path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9" />
             <path d="M13.73 21a2 2 0 0 1-3.46 0" />
           </svg>
+          {pollDegraded && (
+            <span
+              data-testid="notification-bell-degraded"
+              title="Can't load notifications right now"
+              className="absolute -bottom-0.5 -right-0.5 h-2.5 w-2.5 rounded-full border-2 border-[var(--background)] bg-[var(--muted-foreground)]"
+            />
+          )}
           {unreadCount > 0 && (
             <span className="absolute -right-1 -top-1 flex h-4 w-4 items-center justify-center rounded-full bg-[var(--primary)] text-[10px] font-bold leading-none text-white">
               {unreadCount > 9 ? "9+" : unreadCount}
@@ -371,6 +426,12 @@ export function NotificationBell({ apiToken }: NotificationBellProps) {
               >
                 {statusFeedback.message}
               </div>
+            )}
+
+            {pollDegraded && (
+              <p className="border-b border-[var(--border)] px-4 py-1.5 text-center text-xs text-[var(--muted-foreground)]">
+                Can&apos;t load new notifications right now. Retrying…
+              </p>
             )}
 
             <div className="max-h-96 overflow-y-auto">
