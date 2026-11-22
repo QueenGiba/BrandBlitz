@@ -10,6 +10,9 @@ import {
   withRetry,
 } from "./client";
 import { STELLAR_NETWORKS } from "./constants";
+import { setLogger } from "./logger";
+
+const loggerWarn = vi.fn();
 
 describe("client", () => {
   describe("getNetwork", () => {
@@ -146,7 +149,8 @@ describe("client", () => {
   describe("withRetry", () => {
     beforeEach(() => {
       vi.useFakeTimers();
-      vi.spyOn(console, "warn").mockImplementation(() => {});
+      loggerWarn.mockClear();
+      setLogger({ warn: loggerWarn });
     });
 
     afterEach(() => {
@@ -326,7 +330,7 @@ describe("client", () => {
       await vi.runAllTimersAsync();
       await promise;
 
-      expect(console.warn).toHaveBeenCalledWith(
+      expect(loggerWarn).toHaveBeenCalledWith(
         expect.stringContaining("Stellar RPC Retry"),
         expect.objectContaining({
           statusCode: 429,
@@ -346,7 +350,7 @@ describe("client", () => {
       await vi.runAllTimersAsync();
       await rejection;
 
-      expect(console.warn).toHaveBeenCalledWith(
+      expect(loggerWarn).toHaveBeenCalledWith(
         expect.stringContaining("Exhausted"),
         expect.objectContaining({
           statusCode: 503,

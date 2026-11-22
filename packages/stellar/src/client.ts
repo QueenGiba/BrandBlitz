@@ -10,6 +10,7 @@ import {
 } from "@stellar/stellar-sdk";
 import { rpc as SorobanRpc } from "@stellar/stellar-sdk";
 import { STELLAR_NETWORKS, type NetworkName } from "./constants";
+import { warn } from "./logger";
 
 // ─── Retry Configuration ─────────────────────────────────────────────────────
 
@@ -70,7 +71,7 @@ function isRetryableError(err: unknown, retryableStatusCodes: number[]): boolean
 
 /**
  * Execute a function with exponential backoff and full jitter retry logic.
- * Logs retry attempts and exhaustion to console.warn for structured logging.
+ * Logs retry attempts and exhaustion through the injectable stellar logger (see ./logger).
  *
  * @param fn - Async function to execute
  * @param options - Retry configuration
@@ -101,7 +102,7 @@ export async function withRetry<T>(fn: () => Promise<T>, options: RetryOptions =
       const delayMs = calculateBackoffDelay(attempt, config.baseDelayMs, config.maxDelayMs);
 
       const statusCode = (err as any)?.response?.status ?? (err as any)?.status;
-      console.warn(
+      warn(
         `[Stellar RPC Retry] Attempt ${attempt + 1}/${config.maxAttempts} failed, retrying in ${delayMs}ms`,
         {
           statusCode,
@@ -117,7 +118,7 @@ export async function withRetry<T>(fn: () => Promise<T>, options: RetryOptions =
   // All retries exhausted
   const error = lastError as any;
   error.retryExhausted = true;
-  console.warn(`[Stellar RPC Retry] Exhausted all ${config.maxAttempts} retry attempts`, {
+  warn(`[Stellar RPC Retry] Exhausted all ${config.maxAttempts} retry attempts`, {
     statusCode: error?.response?.status ?? error?.status,
     errorMessage: error?.message ?? String(error),
   });
