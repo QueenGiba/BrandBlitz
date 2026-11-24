@@ -71,7 +71,9 @@ function isRetryableError(err: unknown, retryableStatusCodes: number[]): boolean
 
 /**
  * Execute a function with exponential backoff and full jitter retry logic.
- * Logs retry attempts and exhaustion through the injectable stellar logger (see ./logger).
+ * Logs retry attempts and exhaustion through the shared StellarLogger
+ * abstraction (issue #866); inject a custom logger via setLogger() from
+ * ./logger to route these warnings through your app's winston instance.
  *
  * @param fn - Async function to execute
  * @param options - Retry configuration

@@ -30,6 +30,64 @@ const badge2: Badge = {
   iconUrl: undefined,
 };
 
+describe("BadgeUnlockModal focus management (#814)", () => {
+  beforeEach(() => {
+    sessionStorageMock.clear();
+  });
+
+  it("moves focus to the close button when the modal opens", () => {
+    render(<BadgeUnlockModal badges={[badge1]} onClose={() => {}} />);
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: /close/i }));
+  });
+
+  it("Tab on the last focusable element wraps to the first inside the modal", () => {
+    render(<BadgeUnlockModal badges={[badge1]} onClose={() => {}} />);
+    const closeBtn = screen.getByRole("button", { name: /close/i });
+    const shareLink = screen.getByRole("link", { name: /Share on X/i });
+
+    shareLink.focus();
+    fireEvent.keyDown(shareLink, { key: "Tab" });
+
+    expect(document.activeElement).toBe(closeBtn);
+  });
+
+  it("Shift+Tab on the first focusable element wraps to the last inside the modal", () => {
+    render(<BadgeUnlockModal badges={[badge1]} onClose={() => {}} />);
+    const closeBtn = screen.getByRole("button", { name: /close/i });
+    const shareLink = screen.getByRole("link", { name: /Share on X/i });
+
+    closeBtn.focus();
+    fireEvent.keyDown(closeBtn, { key: "Tab", shiftKey: true });
+
+    expect(document.activeElement).toBe(shareLink);
+  });
+
+  it("Tab from outside the modal pulls focus back into it", () => {
+    const outside = document.createElement("button");
+    document.body.appendChild(outside);
+    render(<BadgeUnlockModal badges={[badge1]} onClose={() => {}} />);
+
+    outside.focus();
+    fireEvent.keyDown(outside, { key: "Tab" });
+
+    expect(screen.getByRole("dialog").contains(document.activeElement)).toBe(true);
+    outside.remove();
+  });
+
+  it("returns focus to the element that opened the modal when it unmounts", () => {
+    const trigger = document.createElement("button");
+    document.body.appendChild(trigger);
+    trigger.focus();
+
+    const { unmount } = render(<BadgeUnlockModal badges={[badge1]} onClose={() => {}} />);
+    expect(document.activeElement).not.toBe(trigger);
+
+    unmount();
+    expect(document.activeElement).toBe(trigger);
+    trigger.remove();
+  });
+});
+
 describe("BadgeUnlockModal", () => {
   beforeEach(() => {
     sessionStorageMock.clear();

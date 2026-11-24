@@ -60,7 +60,8 @@ export function ReportModal({ challengeId, open, onOpenChange }: ReportModalProp
       const api = createApiClient();
       await api.post(`/challenges/${challengeId}/report`, {
         reason,
-        note: note.trim() || undefined,
+        // The API schema reads `details`; sending `note` is stripped silently (#823).
+        details: note.trim() || undefined,
       });
       lastSubmitRef.current = now;
       toast.success("Report submitted. Thank you for helping keep BrandBlitz safe.");
